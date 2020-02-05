@@ -1,0 +1,115 @@
+#!/bin/bash
+########################################################################################
+# SUSE Enterprise Storage 5 Performance Tester
+# Author: Boyd Memmott <boyd.memmott@suse.com>
+SVER='1.00-001_jar1'
+SDATE="2018 09 18"
+#
+# Description: Runs fio on the specified device and records associated statistics
+######################################################################################## 
+# Change Log:
+#
+#
+echo "Version: $SVER"
+echo "Date: $SDATE"
+trap "exit" INT TERM ERR
+trap "kill 0" EXIT
+MYDIR=$(pwd)
+
+NUMJOBS="8 16 32 64"
+REMOTEHOST="FQDN of remote OSD node"
+
+DeviceList="$@"
+if [[ -z $DeviceList ]]; then
+        echo " ERROR: Missing device list"
+        echo " example: /mnt/ceph_backup/fio-test "
+        echo " Usage: $0 <space_separated_device_list>"
+        echo
+        exit
+fi
+echo " ============================================================="
+echo " This script is intended to run fio on a cephfs mount"
+echo " and gather iostat data on a remote OSD node."
+echo " edit NUMJOBS & REMOTEHOST variables in this script as needed."
+echo 
+echo " example: /mnt/ceph_backup/fio-test "
+echo 
+echo " Running fio at: $DeviceList"
+echo " Testing fio numjobs= $NUMJOBS "
+echo " Remote host gathering iostat data: $REMOTEHOST"
+echo
+echo
+echo " If the script is aborted, it will be necessary to"
+echo " manually kill iostat process on the remote host."
+echo
+echo
+
+#== Checking if iostat is already running on remote host ==
+preiopids=$(ssh $REMOTEHOST "ps axwwo pid,cmd  | grep iostat | grep -v grep" | awk '{print $1}' | xargs | tr ' ' '|')
+[[ -n $preiopids ]] && preiopids="${preiopids}|"
+echo " Excluding iostat PIDS = $preiopids"
+CHECKING=1
+
+while (( $CHECKING ))
+do
+  printf " Do you want to run fio against this path? [yN] "
+  read ANS
+  case $ANS in
+    y*|Y* ) CHECKING=0;;
+    * ) exit 0;;
+  esac
+done
+echo
+#== Running fio and looping through NUMJOBS ==
+for i in $NUMJOBS; do
+  echo " ===Start fio test==="
+  echo " Running fio with numbjobs= $i "
+  DateTime=$(date +%Y%m%d-%H%M%S)
+#  echo "DateTime== $DateTime =="
+#  echo "RemoteHost== $REMOTEHOST =="
+  REMOTEFILENAME="$DateTime-$REMOTEHOST-${i}.log"
+  echo " Remote File Name= $REMOTEFILENAME"
+  echo " Starting iostat on remote host"
+  #== Starting iostat on remote host ==
+  ssh root@$REMOTEHOST "nohup iostat -x 1 >>/var/log/$REMOTEFILENAME 2>&1" &>/dev/null &
+  sleep 2
+  #== Getting iostat pid from remote host ==
+  pid=$(ssh root@${REMOTEHOST} "ps axwwo pid,cmd" | grep iostat | egrep -v "${preiopids}grep|bash" | awk '{print $1}')
+  echo " pid= $pid"
+  # These two lines are for testing in place of the fio command.
+  # echo " sleeping 10 sec.."
+  # sleep 10
+  #== Start of fio command ====
+  fio --name=nfsclient \
+	`# How to put a line comment for a multi-line command` \
+	--directory=$DeviceList \
+	--numjobs=$i \
+	--write_bw_log=$"$DateTime-$HOSTNAME-$i.fio" \
+	--output=$"$DateTime-$HOSTNAME-$i.fio.log" \
+	--log_avg_msec=1000 \
+	`# [global]` \
+	--size=64G \
+	--direct=1 \
+	--ioengine=libaio \
+	--nrfiles=32 \
+	--fallocate=none \
+	`# --runtime=60` \
+	`# [backup]` \
+	--rw=write \
+	`# --rwmixread=10` \
+	--bs=4M \
+	--iodepth=128 \
+	`# --numjobs=8` \
+	`# --fdatasync=1 (Maybe requested by engineering)` \
+
+  #== End of fio command ==
+
+  #== Killing remote iostat by pid ==
+  echo " killing iostat $pid"
+  ssh root@${REMOTEHOST} "kill $pid" &>/dev/null
+  sleep 2
+  echo " ======= DONE ======="
+  echo ""
+done
+echo " ==== FINAL DONE ===="
+echo " iostat data is located at: $REMOTEHOST:/var/log"
